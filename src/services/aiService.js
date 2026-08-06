@@ -1,16 +1,7 @@
 const axios = require("axios");
-const {
-  GEMINI_API_KEY,
-  GEMINI_BASE_URL,
-  TEXT_MODEL,
-  IMAGE_MODEL,
-} = require("../config/gemini");
+const { GEMINI_BASE_URL, GEMINI_API_KEY, TEXT_MODEL } = require("../config/gemini");
 
-/**
- * Generates a caption for the daily Instagram post.
- * You control the "personality"/topic by editing the prompt below
- * or passing a custom `topicPrompt`.
- */
+
 async function generateCaption(topicPrompt) {
   const prompt =
     topicPrompt ||
@@ -18,67 +9,48 @@ async function generateCaption(topicPrompt) {
 
   try {
     const url = `${GEMINI_BASE_URL}/${TEXT_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-
     const response = await axios.post(url, {
-      contents: [
-        {
-          parts: [{ text: prompt }],
-        },
-      ],
-    });
+      contents: [{ parts: [{ text: prompt }] }],
+    }, { timeout: 20000 });
 
-    const text =
-      response.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-
-    if (!text) {
-      return { success: false, error: "No caption text returned from Gemini" };
-    }
+    const text = response.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+    if (!text) return { success: false, error: "No caption text returned from Gemini" };
 
     return { success: true, caption: text };
   } catch (err) {
-    return {
-      success: false,
-      error: err.response?.data?.error?.message || err.message,
-    };
+    return { success: false, error: err.response?.data?.error?.message || err.message };
   }
 }
 
 /**
- * Generates an image for the daily Instagram post using Pollinations.ai's
- * Flux model - free, no API key, no signup, no billing required.
- * Returns raw base64 image data + mime type - the caller (Cloudinary
- * upload service) is responsible for turning this into a public URL.
+ * Pollinations already serves the image at a stable, public URL - we don't
+ * need to re-host it anywhere for Instagram to be able to fetch it.
+ * We still download the bytes here so Cloudinary can be used as a fallback
+ * host if the direct URL ever turns out to be unreachable from Meta's side.
  */
 async function generateImage(imagePrompt) {
   const prompt =
     imagePrompt ||
     "A clean, minimal, aesthetic photo representing daily motivation and productivity, soft natural lighting, no text.";
 
-  try {
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}`;
+  const seed = Math.floor(Math.random() * 1_000_000); // avoids any CDN caching returning yesterday's image
+  const baseUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}`;
+  const sourceUrl = `${baseUrl}?width=1024&height=1024&nologo=true&seed=${seed}`;
 
-    const response = await axios.get(url, {
-      params: {
-        width: 1024,
-        height: 1024,
-        nologo: true,
-      },
+  try {
+    const response = await axios.get(baseUrl, {
+      params: { width: 1024, height: 1024, nologo: true, seed },
       responseType: "arraybuffer",
+      timeout: 30000,
     });
 
     const base64Data = Buffer.from(response.data).toString("base64");
     const mimeType = response.headers["content-type"] || "image/jpeg";
 
-    return { success: true, base64Data, mimeType };
+    return { success: true, base64Data, mimeType, sourceUrl };
   } catch (err) {
-    return {
-      success: false,
-      error: err.response?.data?.toString() || err.message,
-    };
+    return { success: false, error: err.response?.data?.toString() || err.message };
   }
 }
 
-module.exports = {
-  generateCaption,
-  generateImage,
-};
+module.exports = { generateCaption, generateImage };

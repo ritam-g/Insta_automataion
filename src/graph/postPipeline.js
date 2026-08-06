@@ -1,200 +1,230 @@
-/**
- * LangGraph pipeline that wires together caption generation, image
- * generation, Cloudinary upload, and Instagram publishing into one
- * automated daily posting flow.
- */
-
-require("@langchain/langgraph/zod");
-const { z } = require("zod");
-const { StateGraph, END } = require("@langchain/langgraph");
-
-const { generateCaption, generateImage } = require("../services/aiService");
-const { uploadImageToCloudinary } = require("../services/uploadService");
-const { postImageToInstagram } = require("../services/instagramService");
-const { getDailyPrompt } = require("../utils/promptrotationdaily");
+const mongoose = require("mongoose");
 
 const Post = require("../models/Post");
 const Log = require("../models/Log");
+const { getDailyPrompt } = require("../utils/promptrotationdaily");
+const { generateCaption, generateImage } = require("../services/aiService");
+const { uploadImageToCloudinary } = require("../services/uploadService");
+const { postImageToInstagram } = require("../services/instagramService");
 
-/**
- * Shared state passed between every node in the graph.
- * `postId` refers to the Mongo _id of the Post document, which must
- * already exist (status: "processing") before the graph is invoked.
- */
-const PostState = z.object({
-  accountId: z.string().optional(),
-  igUserId: z.string().optional(),
-  accessToken: z.string().optional(),
-  postId: z.string().optional(),
-  caption: z.string().optional(),
-  imageBase64: z.string().optional(),
-  imageMimeType: z.string().optional(),
-  imageUrl: z.string().optional(),
-  igMediaId: z.string().optional(),
-  error: z.string().optional(),
-  failedStage: z.string().optional(),
-});
+function isValidPostId(postId) {
+  return Boolean(postId) && mongoose.isValidObjectId(postId);
+}
 
-/**
- * Writes a log entry for a pipeline stage.
- * Never throws - a logging failure should not crash the pipeline.
- */
-async function writeLog(postId, stage, status, message) {
+function normalizeMessage(message) {
+  if (message == null) return "";
+  if (typeof message === "string") return message;
+
   try {
-    await Log.create({ postId, stage, status, message });
+    return JSON.stringify(message);
+  } catch (_) {
+    return String(message);
+  }
+}
+
+// Logging and post updates are best-effort. A DB write problem should not stop the post.
+async function writeLog(postId, stage, status, message) {
+  if (!isValidPostId(postId)) {
+    return null;
+  }
+
+  try {
+    return await Log.create({
+      postId,
+      stage,
+      status,
+      message: normalizeMessage(message).slice(0, 1000),
+    });
   } catch (err) {
-    console.error("[Log] Failed to write log entry:", err.message);
+    console.error(`[Pipeline] Failed to write ${stage} log:`, err.message);
+    return null;
   }
 }
 
-/**
- * Node 1: Generate the caption text via Gemini.
- * Uses today's rotating theme so the topic changes daily instead
- * of always using the same default prompt.
- */
-async function generateCaptionNode(state) {
-  const { captionTopic } = getDailyPrompt();
-  const result = await generateCaption(captionTopic);
-
-  if (!result.success) {
-    await writeLog(state.postId, "caption_generation", "failure", result.error);
-    return { error: result.error, failedStage: "caption_generation" };
+async function updatePost(postId, update) {
+  if (!isValidPostId(postId)) {
+    return null;
   }
 
-  await writeLog(state.postId, "caption_generation", "success", result.caption);
-  return { caption: result.caption };
-}
-
-/**
- * Node 2: Generate the image via Pollinations.ai.
- * Uses today's rotating theme so the visual style changes daily
- * alongside the caption topic.
- * Returns base64 data - not yet a usable public URL.
- */
-async function generateImageNode(state) {
-  const { imagePrompt } = getDailyPrompt();
-  const result = await generateImage(imagePrompt);
-
-  if (!result.success) {
-    await writeLog(state.postId, "image_generation", "failure", result.error);
-    return { error: result.error, failedStage: "image_generation" };
+  try {
+    return await Post.findByIdAndUpdate(postId, update, { new: true });
+  } catch (err) {
+    console.error(`[Pipeline] Failed to update post ${postId}:`, err.message);
+    return null;
   }
-
-  await writeLog(state.postId, "image_generation", "success", "Image generated");
-  return { imageBase64: result.base64Data, imageMimeType: result.mimeType };
 }
 
-/**
- * Node 3: Upload the generated image to Cloudinary to get a public URL.
- * Instagram's API requires a public image_url, not raw base64.
- */
-async function uploadImageNode(state) {
-  const result = await uploadImageToCloudinary({
-    base64Data: state.imageBase64,
-    mimeType: state.imageMimeType,
+async function failPipeline({ postId, stage, error, postUpdate = {}, details = {} }) {
+  await writeLog(postId, stage, "failure", error);
+  await updatePost(postId, {
+    ...postUpdate,
+    status: "failed",
+    errorMessage: error,
   });
 
-  if (!result.success) {
-    await writeLog(state.postId, "image_upload", "failure", result.error);
-    return { error: result.error, failedStage: "image_upload" };
+  return {
+    success: false,
+    failedStage: stage,
+    error,
+    ...details,
+  };
+}
+
+async function runDailyPostPipeline({ postId, igUserId, accessToken, accountId = null }) {
+  if (!postId) {
+    throw new Error("postId is required");
   }
 
-  await writeLog(state.postId, "image_upload", "success", result.publicUrl);
-  return { imageUrl: result.publicUrl };
-}
-
-/**
- * Node 4: Publish to Instagram.
- * instagramService.postImageToInstagram() internally handles the
- * create-container -> poll-status -> publish sequence.
- */
-async function publishToInstagramNode(state) {
-  const result = await postImageToInstagram({
-    igUserId: state.igUserId,
-    accessToken: state.accessToken,
-    imageUrl: state.imageUrl,
-    caption: state.caption,
-  });
-
-  if (!result.success) {
-    await writeLog(state.postId, result.stage || "media_publish", "failure", result.error);
-    return { error: result.error, failedStage: result.stage || "media_publish" };
+  if (!igUserId) {
+    throw new Error("igUserId is required");
   }
 
-  await writeLog(state.postId, "media_publish", "success", result.igMediaId);
-  return { igMediaId: result.igMediaId };
-}
-
-/**
- * Node 5: Finalize - update the Post document with the run's outcome,
- * whether it succeeded or failed at some earlier stage.
- */
-async function finalizeNode(state) {
-  if (state.error) {
-    await Post.findByIdAndUpdate(state.postId, {
-      status: "failed",
-      errorMessage: `[${state.failedStage}] ${state.error}`,
-    });
-  } else {
-    await Post.findByIdAndUpdate(state.postId, {
-      status: "posted",
-      igMediaId: state.igMediaId,
-      imageUrl: state.imageUrl,
-      caption: state.caption,
-      publishedAt: new Date(),
-    });
+  if (!accessToken) {
+    throw new Error("accessToken is required");
   }
-  return {};
-}
 
-/**
- * Conditional router used after every node.
- * If a node set `state.error`, skip straight to "finalize" instead
- * of continuing the pipeline and wasting further API calls.
- */
-function routeAfter(nextNode) {
-  return (state) => (state.error ? "finalize" : nextNode);
-}
-
-/**
- * Builds and compiles the LangGraph pipeline.
- */
-function buildPostingGraph() {
-  const graph = new StateGraph(PostState)
-    .addNode("generate_caption", generateCaptionNode)
-    .addNode("generate_image", generateImageNode)
-    .addNode("upload_image", uploadImageNode)
-    .addNode("publish_to_instagram", publishToInstagramNode)
-    .addNode("finalize", finalizeNode)
-
-    .addEdge("__start__", "generate_caption")
-    .addConditionalEdges("generate_caption", routeAfter("generate_image"))
-    .addConditionalEdges("generate_image", routeAfter("upload_image"))
-    .addConditionalEdges("upload_image", routeAfter("publish_to_instagram"))
-    .addConditionalEdges("publish_to_instagram", routeAfter("finalize"))
-    .addEdge("finalize", END);
-
-  return graph.compile();
-}
-
-/**
- * Runs the full daily posting pipeline for a given account.
- * `postId` must already exist in Mongo (status: "processing") before
- * calling this - the route or cron job that triggers this pipeline
- * is responsible for creating that document first.
- */
-async function runDailyPostPipeline({ postId, igUserId, accessToken }) {
-  const app = buildPostingGraph();
-
-  const finalState = await app.invoke({
+  const dailyPrompt = getDailyPrompt();
+  const pipelineDetails = {
     postId,
-    igUserId,
-    accessToken,
-  });
+    accountId,
+    themeKey: dailyPrompt.themeKey,
+    cycleDay: dailyPrompt.cycleDay,
+    cycleLength: dailyPrompt.cycleLength,
+  };
 
-  return finalState;
+  try {
+    await updatePost(postId, {
+      status: "processing",
+      errorMessage: "",
+    });
+
+    const captionResult = await generateCaption(dailyPrompt.captionTopic);
+    if (!captionResult.success) {
+      return failPipeline({
+        postId,
+        stage: "caption_generation",
+        error: captionResult.error,
+        details: pipelineDetails,
+      });
+    }
+
+    await writeLog(
+      postId,
+      "caption_generation",
+      "success",
+      `Generated caption for ${dailyPrompt.themeKey}`
+    );
+    await updatePost(postId, {
+      caption: captionResult.caption,
+    });
+
+    const imageResult = await generateImage(dailyPrompt.imagePrompt);
+    if (!imageResult.success) {
+      return failPipeline({
+        postId,
+        stage: "image_generation",
+        error: imageResult.error,
+        postUpdate: { caption: captionResult.caption },
+        details: pipelineDetails,
+      });
+    }
+
+    await writeLog(
+      postId,
+      "image_generation",
+      "success",
+      `Generated image for ${dailyPrompt.themeKey}`
+    );
+
+    const uploadResult = await uploadImageToCloudinary({
+      base64Data: imageResult.base64Data,
+      mimeType: imageResult.mimeType,
+    });
+
+    if (!uploadResult.success) {
+      return failPipeline({
+        postId,
+        stage: "image_upload",
+        error: uploadResult.error,
+        postUpdate: { caption: captionResult.caption },
+        details: pipelineDetails,
+      });
+    }
+
+    await writeLog(postId, "image_upload", "success", "Uploaded image to Cloudinary");
+    await updatePost(postId, {
+      imageUrl: uploadResult.publicUrl,
+    });
+
+    const publishResult = await postImageToInstagram({
+      igUserId,
+      accessToken,
+      imageUrl: uploadResult.publicUrl,
+      caption: captionResult.caption,
+    });
+
+    if (!publishResult.success) {
+      return failPipeline({
+        postId,
+        stage: publishResult.stage || "media_publish",
+        error: publishResult.error,
+        postUpdate: {
+          caption: captionResult.caption,
+          imageUrl: uploadResult.publicUrl,
+        },
+        details: pipelineDetails,
+      });
+    }
+
+    await writeLog(
+      postId,
+      "media_container",
+      "success",
+      `Created Instagram container ${publishResult.creationId}`
+    );
+    await writeLog(
+      postId,
+      "media_publish",
+      "success",
+      `Published Instagram media ${publishResult.igMediaId}`
+    );
+
+    const publishedAt = new Date();
+    await updatePost(postId, {
+      caption: captionResult.caption,
+      imageUrl: uploadResult.publicUrl,
+      igCreationId: publishResult.creationId,
+      igMediaId: publishResult.igMediaId,
+      status: "posted",
+      publishedAt,
+      errorMessage: "",
+    });
+
+    return {
+      success: true,
+      ...pipelineDetails,
+      caption: captionResult.caption,
+      imageUrl: uploadResult.publicUrl,
+      igCreationId: publishResult.creationId,
+      igMediaId: publishResult.igMediaId,
+      publishedAt,
+    };
+  } catch (err) {
+    const errorMessage = err.message || String(err);
+    console.error("[Pipeline] Unexpected failure:", errorMessage);
+
+    await updatePost(postId, {
+      status: "failed",
+      errorMessage,
+    });
+
+    return {
+      success: false,
+      failedStage: "pipeline",
+      error: errorMessage,
+      ...pipelineDetails,
+    };
+  }
 }
 
-module.exports = {
-  runDailyPostPipeline,
-};
+module.exports = { runDailyPostPipeline };
