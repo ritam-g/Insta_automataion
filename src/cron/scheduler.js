@@ -1,7 +1,7 @@
 /**
  * Cron scheduler - triggers the daily Instagram posting pipeline
- * at a configured time. Also exposes a `runNow()` helper used by
- * the manual "run now" API route.
+ * at a configured time. Also exposes a `triggerDailyPost()` helper
+ * used by the manual "run now" API route.
  */
 
 const cron = require("node-cron");
@@ -13,11 +13,44 @@ const { decrypt } = require("../utils/encryption");
 const { refreshExpiringTokens } = require("../controllers/tokenController");
 
 /**
+ * Guards against double-posting the same day - e.g. if UptimeRobot
+ * fires twice close together, or someone hits the real (non-random)
+ * /run-now endpoint after the cron/UptimeRobot trigger already ran.
+ * Only checked for the deterministic daily flow, never for random
+ * test runs (see triggerDailyPost below).
+ */
+async function hasAlreadyPostedToday() {
+  const startOfDay = new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+
+  const existing = await Post.findOne({
+    status: { $in: ["processing", "posted"] },
+    createdAt: { $gte: startOfDay },
+  });
+
+  return Boolean(existing);
+}
+
+/**
  * Creates a "processing" Post document, runs the pipeline against it,
  * and returns the final state. Used by both the cron job and the
  * manual "run now" route so the logic only lives in one place.
+ *
+ * @param {object} options
+ * @param {"daily"|"random"} [options.promptMode] - "daily" (default)
+ *   follows the fixed 30-day rotation and is subject to the same-day
+ *   duplicate guard. "random" is for manual testing via
+ *   /run-now?random=true - skips the duplicate guard since it's not
+ *   meant to represent the real daily post.
  */
-async function triggerDailyPost() {
+async function triggerDailyPost(options = {}) {
+  const { promptMode = "daily" } = options;
+
+  if (promptMode === "daily" && (await hasAlreadyPostedToday())) {
+    console.log("[Cron] Already posted/processing today - skipping duplicate trigger");
+    return { success: true, skipped: true, reason: "Already posted today" };
+  }
+
   /**
    * For now this app manages a single Instagram account.
    * We just grab the first active one.
@@ -45,7 +78,7 @@ async function triggerDailyPost() {
     scheduledTime: new Date(),
   });
 
-  console.log(`[Cron] Starting pipeline for post ${post._id}`);
+  console.log(`[Cron] Starting pipeline for post ${post._id} (promptMode: ${promptMode})`);
 
   /**
    * Decrypt the stored token right before use - it should never sit
@@ -67,6 +100,7 @@ async function triggerDailyPost() {
     postId: post._id.toString(),
     igUserId: account.igUserId,
     accessToken: decryptedToken,
+    promptMode,
   });
 
   if (finalState.error) {
@@ -93,7 +127,7 @@ function startDailyPostCron() {
 
   cron.schedule(cronExpression, async () => {
     console.log(`[Cron] Daily post job triggered at ${new Date().toISOString()}`);
-    await triggerDailyPost();
+    await triggerDailyPost(); // always "daily" mode - real automated post
   });
 
   console.log(`[Cron] Daily post job scheduled with expression: ${cronExpression}`);

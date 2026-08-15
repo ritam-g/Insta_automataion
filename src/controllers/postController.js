@@ -8,20 +8,36 @@ const Log = require("../models/Log");
 const { triggerDailyPost } = require("../cron/scheduler");
 
 /**
- * POST /api/posts/run-now
- * Manually runs the full posting pipeline immediately,
- * without waiting for the daily cron schedule.
+ * GET /api/posts/run-now
+ * GET /api/posts/run-now?random=true
+ *
+ * Manually/automatically runs the posting pipeline immediately.
+ *
+ * - No query param (what UptimeRobot pings) -> "daily" mode, follows
+ *   the fixed 30-day rotation, guarded against same-day duplicates.
+ *   This is your real production trigger.
+ * - ?random=true -> "random" mode, picks a random day's theme, skips
+ *   the duplicate guard. For manual testing only - never hit this
+ *   from UptimeRobot or anything automated.
+ *
+ * Responds immediately (202) instead of waiting for the full pipeline
+ * (caption -> image -> upload -> Instagram publish) to finish, so
+ * slow runs or Render cold-starts can't make UptimeRobot time out and
+ * falsely report the service as down. The pipeline keeps running in
+ * the background; check GET /api/posts or /api/posts/:id for the
+ * real outcome.
  */
 async function runNow(req, res) {
-  const result = await triggerDailyPost();
+  const promptMode = req.query.random === "true" ? "random" : "daily";
 
-  if (result.error) {
-    return res
-      .status(500)
-      .json({ success: false, stage: result.failedStage, error: result.error });
-  }
+  res.status(202).json({
+    success: true,
+    message: `Pipeline triggered in background (promptMode: ${promptMode})`,
+  });
 
-  res.json({ success: true, igMediaId: result.igMediaId });
+  triggerDailyPost({ promptMode }).catch((err) => {
+    console.error("[runNow] Unhandled pipeline error:", err.message);
+  });
 }
 
 /**

@@ -2,8 +2,9 @@ const mongoose = require("mongoose");
 
 const Post = require("../models/Post");
 const Log = require("../models/Log");
-const { getDailyPrompt } = require("../utils/promptrotationdaily");
+const { getDailyPrompt, getRandomPrompt } = require("../utils/promptrotationdaily");
 const { generateCaption, generateImage } = require("../services/aiService");
+const { overlayFactOnImage } = require("../services/imageComposeService");
 const { uploadImageToCloudinary } = require("../services/uploadService");
 const { postImageToInstagram } = require("../services/instagramService");
 
@@ -70,7 +71,20 @@ async function failPipeline({ postId, stage, error, postUpdate = {}, details = {
   };
 }
 
-async function runDailyPostPipeline({ postId, igUserId, accessToken, accountId = null }) {
+/**
+ * @param {string} promptMode - "daily" (default) uses the fixed,
+ *   day-indexed rotation - this is what cron and the default /run-now
+ *   hit use, so real automated posts always follow the 30-day order.
+ *   "random" picks a random day's theme on every call - used ONLY for
+ *   manual testing via /run-now?random=true, never for real automation.
+ */
+async function runDailyPostPipeline({
+  postId,
+  igUserId,
+  accessToken,
+  accountId = null,
+  promptMode = "daily",
+}) {
   if (!postId) {
     throw new Error("postId is required");
   }
@@ -83,10 +97,11 @@ async function runDailyPostPipeline({ postId, igUserId, accessToken, accountId =
     throw new Error("accessToken is required");
   }
 
-  const dailyPrompt = getDailyPrompt();
+  const dailyPrompt = promptMode === "random" ? getRandomPrompt() : getDailyPrompt();
   const pipelineDetails = {
     postId,
     accountId,
+    promptMode,
     themeKey: dailyPrompt.themeKey,
     cycleDay: dailyPrompt.cycleDay,
     cycleLength: dailyPrompt.cycleLength,
@@ -136,9 +151,37 @@ async function runDailyPostPipeline({ postId, igUserId, accessToken, accountId =
       `Generated image for ${dailyPrompt.themeKey}`
     );
 
+    // Draw the day's real fact directly onto the image (quote-card
+    // style banner) - reliable, correctly spelled, unlike asking the
+    // AI image model to render text itself.
+    let composedBase64 = imageResult.base64Data;
+    let composedMimeType = imageResult.mimeType;
+
+    try {
+      const backgroundBuffer = Buffer.from(imageResult.base64Data, "base64");
+      const composedBuffer = await overlayFactOnImage({
+        imageBuffer: backgroundBuffer,
+        factText: dailyPrompt.factText,
+      });
+      composedBase64 = composedBuffer.toString("base64");
+      composedMimeType = "image/jpeg";
+
+      await writeLog(
+        postId,
+        "image_compose",
+        "success",
+        `Overlaid fact text for ${dailyPrompt.themeKey}`
+      );
+    } catch (composeErr) {
+      // Non-fatal: fall back to the plain background image rather than
+      // failing the whole pipeline over a text-overlay problem.
+      console.error("[Pipeline] Image compose failed, using plain background:", composeErr.message);
+      await writeLog(postId, "image_compose", "failure", composeErr.message);
+    }
+
     const uploadResult = await uploadImageToCloudinary({
-      base64Data: imageResult.base64Data,
-      mimeType: imageResult.mimeType,
+      base64Data: composedBase64,
+      mimeType: composedMimeType,
     });
 
     if (!uploadResult.success) {
