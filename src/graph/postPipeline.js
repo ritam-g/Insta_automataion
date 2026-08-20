@@ -3,6 +3,7 @@ const mongoose = require("mongoose");
 const Post = require("../models/Post");
 const Log = require("../models/Log");
 const { getDailyPrompt, getRandomPrompt } = require("../utils/promptrotationdaily");
+const { getRandomSong, formatSongTag } = require("../utils/songRotation");
 const { generateCaption, generateImage } = require("../services/aiService");
 const { overlayFactOnImage } = require("../services/imageComposeService");
 const { uploadImageToCloudinary } = require("../services/uploadService");
@@ -123,14 +124,20 @@ async function runDailyPostPipeline({
       });
     }
 
+    // Pick a random Hindi/English song and append it as a "Now Playing"
+    // tag at the end of the caption. Title + artist only - no lyrics -
+    // so this never touches copyright.
+    const song = getRandomSong();
+    const finalCaption = `${captionResult.caption}\n\n${formatSongTag(song)}`;
+
     await writeLog(
       postId,
       "caption_generation",
       "success",
-      `Generated caption for ${dailyPrompt.themeKey}`
+      `Generated caption for ${dailyPrompt.themeKey} (song: ${song.title} - ${song.artist})`
     );
     await updatePost(postId, {
-      caption: captionResult.caption,
+      caption: finalCaption,
     });
 
     const imageResult = await generateImage(dailyPrompt.imagePrompt);
@@ -139,7 +146,7 @@ async function runDailyPostPipeline({
         postId,
         stage: "image_generation",
         error: imageResult.error,
-        postUpdate: { caption: captionResult.caption },
+        postUpdate: { caption: finalCaption },
         details: pipelineDetails,
       });
     }
@@ -189,7 +196,7 @@ async function runDailyPostPipeline({
         postId,
         stage: "image_upload",
         error: uploadResult.error,
-        postUpdate: { caption: captionResult.caption },
+        postUpdate: { caption: finalCaption },
         details: pipelineDetails,
       });
     }
@@ -203,7 +210,7 @@ async function runDailyPostPipeline({
       igUserId,
       accessToken,
       imageUrl: uploadResult.publicUrl,
-      caption: captionResult.caption,
+      caption: finalCaption,
     });
 
     if (!publishResult.success) {
@@ -212,7 +219,7 @@ async function runDailyPostPipeline({
         stage: publishResult.stage || "media_publish",
         error: publishResult.error,
         postUpdate: {
-          caption: captionResult.caption,
+          caption: finalCaption,
           imageUrl: uploadResult.publicUrl,
         },
         details: pipelineDetails,
@@ -234,7 +241,7 @@ async function runDailyPostPipeline({
 
     const publishedAt = new Date();
     await updatePost(postId, {
-      caption: captionResult.caption,
+      caption: finalCaption,
       imageUrl: uploadResult.publicUrl,
       igCreationId: publishResult.creationId,
       igMediaId: publishResult.igMediaId,
@@ -246,7 +253,7 @@ async function runDailyPostPipeline({
     return {
       success: true,
       ...pipelineDetails,
-      caption: captionResult.caption,
+      caption: finalCaption,
       imageUrl: uploadResult.publicUrl,
       igCreationId: publishResult.creationId,
       igMediaId: publishResult.igMediaId,
